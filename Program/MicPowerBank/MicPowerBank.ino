@@ -31,16 +31,18 @@
  *       充电期无论怎么进入, 只要被单击打断, 就一律回充电前期
  *    3. 充电后期计时到点 -> 充电前期; 后期内单击 -> 立即进入充电期(算手动进入,
  *       结束后回前期)
- *    4. 长按 10s -> 指示灯快闪 3 下, 进入"时长调节模式", 详见下方调节说明
- *    5. 电池电压通过内部 1.1V 基准自测(无需外部电阻分压);
+ *    4. 低电闪烁提醒期间长按 5s -> 停止本轮低电闪烁提醒;
+ *       电池电压恢复到 VBAT_LOW_EXIT_MV 以上后, 再次低于阈值会重新提醒
+ *    5. 长按 10s -> 指示灯快闪 3 下, 进入"时长调节模式", 详见下方调节说明
+ *    6. 电池电压通过内部 1.1V 基准自测(无需外部电阻分压);
  *       低于 VBAT_LOW_ENTER_MV 后指示灯按档位闪烁, 电量越低越快:
  *       从 5s 一次逐档缩短到 300ms 一次(每档为固定频率, 不连续变化)
- *    6. 平时 MCU 处于 Power-Down, 由看门狗定时器(16ms~8.2s 自适应)唤醒,
+ *    7. 平时 MCU 处于 Power-Down, 由看门狗定时器(16ms~8.2s 自适应)唤醒,
  *       睡眠时关闭 BOD, 关闭 Timer0/1/USI/ADC, 静态电流约几 uA
- *    7. 单击判定: 只要松手时"还没按到第一个长按门限"就算单击(不留空档区);
+ *    8. 单击判定: 只要松手时"还没按到第一个长按门限"就算单击(不留空档区);
  *       运行模式下单击被识别时指示灯"快闪 2 下"(CLICK_FEEDBACK=1),
  *       调节模式里单击是"闪 1 下", 数闪的次数即可知道自己处于哪个模式
- *    8. 调节模式 2 分钟无任何操作会自动放弃退出(闪 5 下), 防止误入后"按键只
+ *    9. 调节模式 2 分钟无任何操作会自动放弃退出(闪 5 下), 防止误入后"按键只
  *       加小时、充电输出始终不动作"的假死现象
  *
  *  ------------------------------------------------------------ 计时精度
@@ -51,14 +53,14 @@
  *  ------------------------------------------------------------ 调节说明
  *    进入 : 运行中长按按键 10s  -> 快闪 3 下 -> 进入调节模式,
  *           从第一项"充电前期"开始; 调节期间输出状态不变、阶段计时暂停
- *    加时长: 每单击一次 +1h 并闪 1 下(数闪几下 = 该项当前设的小时数)
+ *    加时长: 每单击一次 +0.5h 并闪 1 下
  *    下一项: 长按 5s -> 快闪 2 下 -> 依次是 前期 -> 充电期 -> 后期
  *    保存退出: 在第三项"充电后期"长按 5s -> 快闪 3 下 -> 写入 EEPROM
  *    放弃退出: 任意一项长按 15s -> 快闪 5 下 -> 不保存, 恢复原来的时长
- *    上限 : 单项最大 ADJ_MAX_HOURS(默认 24)h; 保存时 0h 会被钳成 1h
+ *    上限 : 单项最大 24h; 保存时 0h 会被钳成 0.5h
  *    单项规则: 进入调节时三项都先保留原来的时长;
  *           某一项如果一次都不单击, 就原样保留(长按 5s 跳到下一项即可);
- *           某一项只要单击过一次, 该项就从 0h 重新算, 点几下就是几小时
+ *           某一项只要单击过一次, 该项就从 0h 重新算, 点一下加 0.5h
  *           (所以想改小也不用先清零, 直接重数一遍就行)
  *    退出后阶段计时从退出时刻继续, 充电期剩余时间不会被调节过程吃掉
  * ==========================================================================*/
@@ -79,7 +81,9 @@
 #define ADJ_NEXT_MS        5000UL   /* 调节模式: 长按 5s 下一阶段/保存退出 */
 #define ADJ_ABORT_MS       15000UL  /* 调节模式: 长按 15s 放弃退出 */
 #define ADJ_IDLE_EXIT_MS   120000UL /* 调节模式无操作自动放弃退出(防止卡在调节模式) */
-#define ADJ_MAX_HOURS      24       /* 单阶段可设置的最大时长(h), 防止误操作 */
+#define LOWBAT_MUTE_MS     5000UL   /* 低电提醒中: 长按 5s 停止本轮提醒 */
+#define ADJ_MAX_HALF_HOURS 48       /* 单阶段最大 24h, 以 0.5h 为单位 */
+#define HALF_HOUR_MS       1800000UL
 
 /* ---- 行为开关 ---- */
 #define PRE_AUTO_CHG       1        /* 1: 充电前期计时到点自动进入充电期(自动充电周期)
@@ -112,8 +116,8 @@
 #define PH_CHG             1
 #define PH_POST            2
 
-/* ---- 默认时长(h): 前期 / 充电期 / 后期 ---- */
-static const uint16_t kDefHours[3] = {9, 4, 11};
+/* ---- 默认时长(0.5h): 前期 / 充电期 / 后期 ---- */
+static const uint16_t kDefHalfHours[3] = {18, 8, 22};
 
 /* ---- 低电闪烁档位: 电压越低于阈值, 档位越靠后, 周期越短 ---- */
 #define BATT_LVLS 8
@@ -126,13 +130,22 @@ static const uint16_t kWdtMs[WDT_LEVELS] = {16, 32, 64, 128, 256, 512, 1024, 204
 
 /* ---- EEPROM 配置 ---- */
 #define CFG_MAGIC   0xA5
-#define CFG_VER     1
+#define CFG_VER     2
+#define CFG_VER_LEGACY_HOURS 1
 typedef struct {
   uint8_t  magic;
   uint8_t  ver;
-  uint16_t hours[3];      /* 前期 / 充电期 / 后期 */
+  uint16_t halfHours[3];  /* 前期 / 充电期 / 后期, 单位 0.5h */
   uint8_t  chk;
 } cfg_t;
+
+/* V1 配置用整小时; 读取后迁移成 0.5h 单位 */
+typedef struct {
+  uint8_t  magic;
+  uint8_t  ver;
+  uint16_t hours[3];
+  uint8_t  chk;
+} cfg_v1_t;
 
 /* ======================= 二、引脚定义 ======================= */
 
@@ -165,6 +178,7 @@ static volatile uint16_t g_step;       /* 当前看门狗周期(ms), 供中断�
 static uint16_t g_vbat;                /* 最近电压(mV) */
 static uint8_t  g_vbatValid;
 static uint8_t  g_battLow;             /* 低电标志 */
+static uint8_t  g_lowBattMuted;        /* 本轮低电提醒已由长按静音 */
 static uint8_t  g_battLvl;             /* 低电档位 */
 static uint32_t g_nextAdc;             /* 下次采样时刻 */
 static uint32_t g_lowNext;             /* 下次低电闪灯时刻 */
@@ -185,12 +199,12 @@ static uint8_t  g_mode;                /* 0=运行, 1=时长调节 */
 static uint8_t  g_phase;               /* PH_PRE / PH_CHG / PH_POST */
 static uint8_t  g_chgAuto;             /* 当前充电期是否为"自动进入"(决定结束后去向) */
 static uint32_t g_phaseStart;
-static uint16_t g_durHours[3];         /* 生效中的时长(h) */
+static uint16_t g_durHalfHours[3];     /* 生效中的时长(0.5h) */
 static uint32_t g_durMs[3];            /* 生效中的时长(ms) */
 
 /* --- 调节模式临时数据 --- */
 static uint8_t  g_adjStage;            /* 0=前期 1=充电期 2=后期 */
-static uint16_t g_adjHours[3];         /* 调节中的临时值(未单击过的项保持原值) */
+static uint16_t g_adjHalfHours[3];     /* 调节中的临时值(未单击过的项保持原值) */
 static uint8_t  g_adjTouched[3];       /* 该项本次调节是否单击过 */
 static uint32_t g_adjEnterMs;
 static uint32_t g_adjLastAct;          /* 调节模式最后一次操作时刻(用于超时退出) */
@@ -231,36 +245,59 @@ uint8_t keyIsDownRaw(void)
 
 /* ======================= 五、EEPROM 配置存取 ======================= */
 
-uint8_t cfgChk(const cfg_t *c)
+uint8_t cfgChkRaw(const uint8_t *p, uint8_t len)
 {
-  const uint8_t *p = (const uint8_t *)c;
   uint8_t s = 0;
   uint8_t i;
-  for (i = 0; i < (sizeof(cfg_t) - 1); i++) s = (uint8_t)(s + p[i]);
+  for (i = 0; i < (uint8_t)(len - 1); i++) s = (uint8_t)(s + p[i]);
   return (uint8_t)(s ^ 0x5A);
 }
 
-uint16_t cfgClamp(uint16_t h)
+uint8_t cfgChk(const cfg_t *c)
 {
-  if (h < 1) h = 1;                    /* 0 无意义, 钳到 1h */
-  if (h > ADJ_MAX_HOURS) h = ADJ_MAX_HOURS;
-  return h;
+  return cfgChkRaw((const uint8_t *)c, sizeof(cfg_t));
+}
+
+uint8_t cfgV1Chk(const cfg_v1_t *c)
+{
+  return cfgChkRaw((const uint8_t *)c, sizeof(cfg_v1_t));
+}
+
+uint16_t cfgClamp(uint16_t halfHours)
+{
+  if (halfHours < 1) halfHours = 1;    /* 0 无意义, 钳到 0.5h */
+  if (halfHours > ADJ_MAX_HALF_HOURS) halfHours = ADJ_MAX_HALF_HOURS;
+  return halfHours;
 }
 
 void cfgLoad(void)
 {
   cfg_t c;
-  uint8_t ok;
   uint8_t i;
 
   eeprom_read_block((void *)&c, (const void *)0, sizeof(c));
-  ok = (c.magic == CFG_MAGIC) && (c.ver == CFG_VER) && (c.chk == cfgChk(&c));
+  {
+    uint8_t current = (c.magic == CFG_MAGIC) &&
+                      (c.ver == CFG_VER) &&
+                      (c.chk == cfgChk(&c));
+    cfg_v1_t old;
+    uint8_t legacy = 0;
 
-  for (i = 0; i < 3; i++) {
-    uint16_t h = ok ? c.hours[i] : kDefHours[i];
-    h = cfgClamp(h);
-    g_durHours[i] = h;
-    g_durMs[i]    = (uint32_t)h * 3600000UL;
+    if (!current) {
+      eeprom_read_block((void *)&old, (const void *)0, sizeof(old));
+      legacy = (old.magic == CFG_MAGIC) &&
+               (old.ver == CFG_VER_LEGACY_HOURS) &&
+               (old.chk == cfgV1Chk(&old));
+    }
+
+    for (i = 0; i < 3; i++) {
+      uint16_t halfHours = current ? c.halfHours[i] :
+                           legacy  ? (uint16_t)(old.hours[i] * 2) :
+                                     kDefHalfHours[i];
+      halfHours = cfgClamp(halfHours);
+      g_durHalfHours[i] = halfHours;
+      g_durMs[i]        = (uint32_t)halfHours * HALF_HOUR_MS;
+    }
   }
 }
 
@@ -270,7 +307,7 @@ void cfgSave(void)
   uint8_t i;
   c.magic = CFG_MAGIC;
   c.ver   = CFG_VER;
-  for (i = 0; i < 3; i++) c.hours[i] = g_durHours[i];
+  for (i = 0; i < 3; i++) c.halfHours[i] = g_durHalfHours[i];
   c.chk = cfgChk(&c);
   eeprom_update_block((const void *)&c, (void *)0, sizeof(c));
 }
@@ -377,6 +414,7 @@ void battProcess(uint32_t now)
     if (g_vbat < VBAT_LOW_ENTER_MV) { g_battLow = 1; g_battLvl = battLvlOf(g_vbat); g_lowNext = now; }
   } else if (g_vbat >= VBAT_LOW_EXIT_MV) {
     g_battLow = 0;
+    g_lowBattMuted = 0;
   }
 
   if (g_battLow) {
@@ -388,7 +426,7 @@ void battProcess(uint32_t now)
 /* 低电闪灯: 每个周期点亮一次(波形尽量窄, 省电) */
 void lowBattProcess(uint32_t now)
 {
-  if (!g_battLow || patBusy()) return;
+  if (!g_battLow || g_lowBattMuted || patBusy()) return;
   if ((int32_t)(now - g_lowNext) < 0) return;
 
   patStart(1, LOWBAT_ON_MS, LOWBAT_ON_MS);
@@ -434,7 +472,7 @@ void adjEnter(uint32_t now)
   g_mode      = 1;
   g_adjStage  = 0;
   for (i = 0; i < 3; i++) {
-    g_adjHours[i]   = g_durHours[i];                 /* 先保留原值 */
+    g_adjHalfHours[i] = g_durHalfHours[i];           /* 先保留原值 */
     g_adjTouched[i] = 0;                             /* 该项还没被单击过 */
   }
   g_adjEnterMs  = now;
@@ -453,8 +491,8 @@ void adjSaveExit(uint32_t now)
 {
   uint8_t i;
   for (i = 0; i < 3; i++) {
-    g_durHours[i] = cfgClamp(g_adjHours[i]);
-    g_durMs[i]    = (uint32_t)g_durHours[i] * 3600000UL;
+    g_durHalfHours[i] = cfgClamp(g_adjHalfHours[i]);
+    g_durMs[i]        = (uint32_t)g_durHalfHours[i] * HALF_HOUR_MS;
   }
   cfgSave();
   adjExit(now);
@@ -491,14 +529,14 @@ void adjIdleCheck(uint32_t now)
 
 void onClick(uint32_t now)
 {
-  if (g_mode != 0) {                                 /* 调节模式: +1h */
+  if (g_mode != 0) {                                 /* 调节模式: +0.5h */
     uint8_t st = g_adjStage;
     g_adjLastAct = now;
     if (!g_adjTouched[st]) {                         /* 本项第一次单击 -> 从 0h 重算 */
       g_adjTouched[st] = 1;
-      g_adjHours[st]   = 0;
+      g_adjHalfHours[st] = 0;
     }
-    if (g_adjHours[st] < ADJ_MAX_HOURS) g_adjHours[st]++;
+    if (g_adjHalfHours[st] < ADJ_MAX_HALF_HOURS) g_adjHalfHours[st]++;
     patStart(1, PAT_ON_MS, PAT_OFF_MS);              /* 闪 1 下 */
     return;
   }
@@ -536,9 +574,10 @@ void keyScan(uint32_t now)
     } else {                                         /* ---- 抬起 ---- */
       uint32_t held = now - g_keyDownMs;
       uint32_t limit = (g_mode != 0) ? ADJ_NEXT_MS : ADJ_ENTER_MS;
+      uint8_t holdAction = g_holdLock;
       g_holdLock = 0;
       /* 只要没按到"第一个长按门限"就按单击处理, 中间不留空档区 */
-      if (held < limit) onClick(now);
+      if (held < limit && !holdAction) onClick(now);
     }
   }
 }
@@ -561,7 +600,12 @@ void keyHold(uint32_t now)
       adjAbort(now);
     }
   } else {                                           /* 运行模式 */
-    if (held >= ADJ_ENTER_MS) {
+    if (g_battLow && !g_lowBattMuted && !g_hold5 && held >= LOWBAT_MUTE_MS) {
+      g_hold5 = 1;
+      g_holdLock = 1;
+      g_lowBattMuted = 1;                            /* 停止本轮低电提醒 */
+      patStart(0, 0, 0);                             /* 立即结束正在播放的脉冲 */
+    } else if (held >= ADJ_ENTER_MS) {
       g_holdLock = 1;
       adjEnter(now);
     }
@@ -613,7 +657,7 @@ uint32_t nextEventDelay(uint32_t now)
     if (t < d) d = t;
   }
 
-  if (g_battLow && !patBusy()) {
+  if (g_battLow && !g_lowBattMuted && !patBusy()) {
     t = untilMs(g_lowNext, now);
     if (t < d) d = t;
   }
@@ -735,6 +779,7 @@ void setup(void)
   g_vbatValid = 0;
   g_vbat      = 0;
   g_battLow   = 0;
+  g_lowBattMuted = 0;
   g_battLvl   = 0;
   g_mode      = 0;
   g_keyRaw    = keyIsDownRaw();
